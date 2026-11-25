@@ -1,0 +1,52 @@
+# Python 运行产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# 虚拟环境（本项目默认使用 C:\xiaoer\venv，不在仓库内）
+.venv/
+venv/
+env/
+ENV/
+.Python
+
+# 测试与缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 本地运行数据与日志（程序实际写在 %APPDATA%\Xiaoer）
+*.log
+error.log
+perf.log
+config.json
+projects.json
+reminders.json
+clipboard.json
+*.db
+*.sqlite
+*.sqlite3
+
+# 本地环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# 编辑器 / 操作系统杂项
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
