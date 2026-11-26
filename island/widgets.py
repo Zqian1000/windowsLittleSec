@@ -94,6 +94,12 @@ def draw_glyph(p: QPainter, kind: str, rect: QRectF, color: QColor) -> None:
         p.drawLine(QPointF(cx - 5, cy - 7), QPointF(cx - 1.5, cy - 7))
         p.drawLine(QPointF(cx - 1.5, cy - 7), QPointF(cx - 0.5, cy - 4))
         p.drawLine(QPointF(cx - 6.5, cy - 1.5), QPointF(cx + 6.5, cy - 1.5))
+    elif kind == "globe":
+        p.drawEllipse(QPointF(cx, cy), 7, 7)
+        p.drawEllipse(QPointF(cx, cy), 3.2, 7)
+        p.drawLine(QPointF(cx - 7, cy), QPointF(cx + 7, cy))
+        p.drawLine(QPointF(cx - 5.8, cy - 3), QPointF(cx + 5.8, cy - 3))
+        p.drawLine(QPointF(cx - 5.8, cy + 3), QPointF(cx + 5.8, cy + 3))
     elif kind == "alert":
         tri = QPainterPath()
         tri.moveTo(cx, cy - 7.5)
@@ -283,7 +289,7 @@ class GlyphButton(QPushButton):
     """
 
     KINDS = ("clip", "snip", "bell", "list", "json", "excel", "gear",
-             "folder", "alert", "doc", "apps")
+             "folder", "alert", "doc", "apps", "globe")
     hovered = Signal(str, QPoint)
 
     def __init__(self, kind: str, tip: str = "", name: str = "", parent=None) -> None:

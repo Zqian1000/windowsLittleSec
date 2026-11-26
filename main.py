@@ -5,7 +5,7 @@ import sys
 import traceback
 
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
@@ -85,12 +85,14 @@ def _run() -> int:
 
     # 剪贴板历史 + 区域截图：两个都是纯本地工具，不联网、不存图片
     store = ClipStore(limit=int(cfg.get("clip_limit", 30) or 30))
-    watcher = ClipboardWatcher(store, bool(cfg.get("clip_enabled", True)))
+    watcher = ClipboardWatcher(store, bool(cfg.get("clip_enabled", True)),
+                               bool(cfg.get("clip_image", True)))
     clip_panel = ClipboardPanel(store, watcher)
     snip_dir = str(cfg.get("snip_dir", "") or "").strip()
     snip = SnipSession(save_dir=snip_dir or None,
                        before_grab=bar.hide_for_snip,
-                       after_grab=bar.restore_after_snip)
+                       after_grab=bar.restore_after_snip,
+                       confirm=lambda: bool(cfg.get("snip_confirm", False)))
     hotkey = GlobalHotkey(str(cfg.get("snip_hotkey", "ctrl+alt+x") or ""))
     hotkey_ok = hotkey.register()
     hotkey.triggered.connect(snip.start)
@@ -100,7 +102,7 @@ def _run() -> int:
     # 提醒：胶囊铃铛建、列表看；到点弹内容泡，截图也能直接转成提醒
     reminder_store = ReminderStore()
     reminders = ReminderCenter(reminder_store, snip=snip,
-                               anchor_provider=bar.geometry)
+                               anchor_provider=bar.visible_rect)
     bar.attach_reminders(reminders)
     snip.reminded.connect(reminders.new_from_image)
     reminders.check()
@@ -141,6 +143,36 @@ def _run() -> int:
         config.save(cfg),
     ))
     menu.addAction(action_edge)
+
+    # 展开后闲置自动收起：秒数直接写在菜单里，0 = 关闭
+    idle_menu = QMenu("展开后自动收起", menu)
+    idle_group = QActionGroup(idle_menu)
+    idle_group.setExclusive(True)
+    current_idle = int(cfg.get("expanded_idle_sec", 30) or 0)
+
+    def _set_idle(sec: int) -> None:
+        bar.set_idle_collapse(sec)
+        cfg.update(expanded_idle_sec=sec)
+        config.save(cfg)
+
+    for label, sec in (("关闭", 0), ("15 秒", 15), ("30 秒", 30),
+                       ("60 秒", 60), ("120 秒", 120)):
+        act = QAction(label, idle_menu)
+        act.setCheckable(True)
+        act.setChecked(current_idle == sec)
+        act.triggered.connect(lambda checked, s=sec: _set_idle(s) if checked else None)
+        idle_group.addAction(act)
+        idle_menu.addAction(act)
+    menu.addMenu(idle_menu)
+
+    action_snip_confirm = QAction("截图后确认", menu)
+    action_snip_confirm.setCheckable(True)
+    action_snip_confirm.setChecked(bool(cfg.get("snip_confirm", False)))
+    action_snip_confirm.triggered.connect(lambda checked: (
+        cfg.update(snip_confirm=checked),
+        config.save(cfg),
+    ))
+    menu.addAction(action_snip_confirm)
 
     action_lyrics = QAction("显示歌词", menu)
     action_lyrics.setCheckable(True)

@@ -339,11 +339,19 @@ class MeritToast(QWidget):
 
 
 class AgentAvatarButton(QPushButton):
-    """38px 木鱼：没有外圈，按下就左右抖动两下并弹「功德 +1」。"""
+    """38px 木鱼：没有外圈，按下就左右抖动两下并弹「功德 +1」。
+
+    连点 20 次会发出 ``easter_egg``，由胶囊决定要不要打开隐藏小游戏。
+    间隔超过 1.2 秒就算断掉，避免把一天里的零散点击累加进去。
+    """
+
+    easter_egg = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._last_tick = time.monotonic()
+        self._click_streak = 0
+        self._streak_at = 0.0
         self._alert = False
         self._press = 0.0
         self._jiggle_start = 0.0
@@ -370,6 +378,16 @@ class AgentAvatarButton(QPushButton):
         self.update()
 
     def _on_click(self) -> None:
+        now = time.monotonic()
+        if now - self._streak_at <= 1.2:
+            self._click_streak += 1
+        else:
+            self._click_streak = 1
+        self._streak_at = now
+        if self._click_streak >= 20:
+            self._click_streak = 0
+            self.easter_egg.emit()
+            return
         self._start_jiggle()
         self._touch_merit()
 

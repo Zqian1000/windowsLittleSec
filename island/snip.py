@@ -15,7 +15,9 @@ from PySide6.QtGui import (
     QColor, QCursor, QFont, QGuiApplication, QKeySequence, QPainter, QPen, QPixmap,
     QShortcut,
 )
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+)
 
 ACCENT = "#0a84ff"
 
@@ -196,6 +198,114 @@ class _Toast(QWidget):
         QTimer.singleShot(3200 if action_text else 1600, self.close)
 
 
+class _ConfirmShot(QWidget):
+    """截图确认卡：框完先给一眼预览，确认后才写剪贴板并落盘。
+
+    默认配置是"不确认"，只有用户在托盘里打开"截图后确认"才会走到这里。
+    取消时什么都不写，避免误截的内容进剪贴板历史。
+    """
+
+    def __init__(self, pix: QPixmap, on_ok: Callable[[], None],
+                 on_cancel: Callable[[], None]) -> None:
+        super().__init__(None)
+        self._on_ok = on_ok
+        self._on_cancel = on_cancel
+        self._decided = False
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool
+                            | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(392)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        card = QWidget(self)
+        card.setObjectName("card")
+        card.setStyleSheet("#card{background:#1c1c1e;border-radius:16px;}")
+        outer.addWidget(card)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(10)
+
+        title = QLabel("确认截图")
+        title.setStyleSheet("color:#f2f2f7;font-size:14px;font-weight:600;")
+        lay.addWidget(title)
+
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("QLabel{background:#2c2c2e;border-radius:10px;}")
+        shown = pix.scaled(360, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview.setPixmap(shown)
+        self.preview.setFixedSize(shown.width(), shown.height())
+        lay.addWidget(self.preview, 0, Qt.AlignHCenter)
+
+        info = QLabel(f"{pix.width()} × {pix.height()}  ·  确认后复制并保存")
+        info.setStyleSheet("color:#98989f;font-size:11px;")
+        lay.addWidget(info)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setMinimumWidth(72)
+        cancel.setStyleSheet(
+            "QPushButton{border:none;border-radius:8px;background:#2c2c2e;"
+            "color:#d1d1d6;font-size:12px;padding:6px 16px;}"
+            "QPushButton:hover{background:#3a3a3c;color:#fff;}")
+        cancel.clicked.connect(self._cancel)
+        btns.addWidget(cancel)
+        ok = QPushButton("保存并复制")
+        ok.setCursor(Qt.PointingHandCursor)
+        ok.setMinimumWidth(116)
+        ok.setStyleSheet(
+            f"QPushButton{{border:none;border-radius:8px;background:{ACCENT};"
+            "color:#fff;font-size:12px;padding:6px 18px;}"
+            "QPushButton:hover{background:#3a9bff;}")
+        ok.clicked.connect(self._ok)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+        self.adjustSize()
+
+    def show_card(self) -> None:
+        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        geo = screen.availableGeometry() if screen else self.rect()
+        self.move(geo.center().x() - self.width() // 2,
+                  geo.center().y() - self.height() // 2)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+
+    def _ok(self) -> None:
+        if self._decided:
+            return
+        self._decided = True
+        self._on_ok()
+        self.close()
+
+    def _cancel(self) -> None:
+        if self._decided:
+            return
+        self._decided = True
+        self._on_cancel()
+        self.close()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self._cancel()
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._ok()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if not self._decided:
+            self._decided = True
+            self._on_cancel()
+        super().closeEvent(event)
+
+
 class SnipSession(QObject):
     """一次截图流程：藏岛 → 抓屏 → 框选 → 复制并存盘 → 提示。"""
 
@@ -206,22 +316,32 @@ class SnipSession(QObject):
     def __init__(self, save_dir: Optional[Path] = None,
                  before_grab: Optional[Callable[[], None]] = None,
                  after_grab: Optional[Callable[[], None]] = None,
+                 confirm: bool | Callable[[], bool] = False,
                  parent=None) -> None:
         super().__init__(parent)
         self.save_dir = Path(save_dir) if save_dir else default_save_dir()
         self._before = before_grab
         self._after = after_grab
+        self._confirm = confirm
         self._overlays: list[_Overlay] = []
         self._on_capture: Optional[Callable[[QPixmap, str], None]] = None
+        self._confirm_dlg: Optional[_ConfirmShot] = None
+        self._pending: Optional[QPixmap] = None
         self._offer = True
         self._hide_at = time.monotonic()
 
+    def _need_confirm(self) -> bool:
+        try:
+            return bool(self._confirm() if callable(self._confirm) else self._confirm)
+        except Exception:
+            return False
+
     def is_active(self) -> bool:
-        return bool(self._overlays)
+        return bool(self._overlays or self._confirm_dlg)
 
     def start(self, on_capture: Optional[Callable[[QPixmap, str], None]] = None,
               offer_reminder: bool = True) -> None:
-        if self._overlays:
+        if self._overlays or self._confirm_dlg is not None:
             return
         self._on_capture = on_capture
         self._offer = offer_reminder
@@ -264,15 +384,48 @@ class SnipSession(QObject):
     def _on_picked(self, pix: QPixmap, _screen) -> None:
         # 不管后面存盘/弹提示哪一步出错，都必须把取景层收掉，
         # 否则窗口会一直压在最上层、Esc 也关不掉（只能任务管理器杀进程）。
+        defer = False
         try:
-            self._handle_pick(pix)
+            defer = self._handle_pick(pix)
         except Exception:
-            # 剪贴板已经写进去了，这里只保证能退出
-            pass
+            # 出错也必须保证能退出
+            defer = False
         finally:
-            self._finish()
+            if not defer:
+                self._finish()
 
-    def _handle_pick(self, pix: QPixmap) -> None:
+    def _handle_pick(self, pix: QPixmap) -> bool:
+        """处理框选结果；需要确认时返回 True，等用户点确认后再收尾。"""
+        if self._need_confirm():
+            self._pending = pix
+            # 先把取景层收掉，让确认卡浮在真实桌面上；会话仍算进行中
+            for ov in self._overlays:
+                try:
+                    ov.close()
+                except Exception:
+                    pass
+            self._overlays = []
+            dlg = _ConfirmShot(pix, self._confirm_ok, self._confirm_cancel)
+            self._confirm_dlg = dlg
+            dlg.show_card()
+            return True
+        self._commit(pix)
+        return False
+
+    def _confirm_ok(self) -> None:
+        pix = self._pending
+        self._pending = None
+        self._confirm_dlg = None
+        if pix is not None:
+            self._commit(pix)
+        self._finish()
+
+    def _confirm_cancel(self) -> None:
+        self._pending = None
+        self._confirm_dlg = None
+        self._finish()
+
+    def _commit(self, pix: QPixmap) -> None:
         from PySide6.QtGui import QGuiApplication as _Q
         if pix.devicePixelRatio() != 1.0:
             pix.setDevicePixelRatio(1.0)     # 复制进剪贴板按原始像素算
@@ -307,6 +460,14 @@ class SnipSession(QObject):
         self._finish()
 
     def _finish(self) -> None:
+        dlg = self._confirm_dlg
+        self._confirm_dlg = None
+        self._pending = None
+        if dlg is not None:
+            try:
+                dlg.close()
+            except Exception:
+                pass
         for ov in self._overlays:
             try:
                 ov.close()

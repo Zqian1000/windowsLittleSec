@@ -9,6 +9,8 @@ from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QWidget
 
+from .popup_layout import place_popup
+
 BG = "#1c1c1e"
 TEXT = "#f2f2f7"
 SUBTEXT = "#98989f"
@@ -34,14 +36,7 @@ class PopupCard(QWidget):
         esc.activated.connect(self.close_panel)
 
     def popup_near(self, anchor: QRect) -> None:
-        screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
-        geo = screen.availableGeometry()
-        x = anchor.center().x() - self.width() // 2
-        y = anchor.bottom() + 8
-        x = max(geo.left() + 6, min(x, geo.right() - self.width() - 6))
-        if y + self.height() > geo.bottom():
-            y = max(geo.top() + 6, anchor.top() - self.height() - 8)
-        self.move(x, y)
+        place_popup(self, anchor)
         self.show()
         self.raise_()
         self.activateWindow()

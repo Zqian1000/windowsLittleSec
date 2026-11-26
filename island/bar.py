@@ -6,6 +6,7 @@ import time
 
 from PySide6.QtCore import (
     Qt, QTimer, QPoint, QRect, QPropertyAnimation, QEasingCurve, QRectF, Signal, QUrl,
+    QEvent,
 )
 from PySide6.QtGui import (
     QPainter, QColor, QBrush, QCursor, QGuiApplication, QPixmap,
@@ -57,6 +58,9 @@ class IslandBar(QWidget):
         self._drag_pos: QPoint | None = None
         self._press_pos: QPoint | None = None
         self._moved = False
+        self._drag_grace_until = 0.0      # 刚拖完的一小段时间里不自动吸回
+        self._last_active = time.monotonic()
+        self._idle_collapse_sec = int(cfg.get("expanded_idle_sec", 30) or 0)
         self._im_accounts: list[im.IMAccount] = []
         self._im_signature: tuple | None = None
         self.coll_buttons: dict = {}
@@ -71,6 +75,7 @@ class IslandBar(QWidget):
         self.app_panel = None           # 应用快开（开始菜单应用列表）
         self.incident_panel = None      # 报错现场包
         self.clerk_panel = None         # 文员工具
+        self.favorites_panel = None     # 网站收藏，首次点开时才建
         self._toast = None
         self._hover_tip = None
         self._toolbox_open = False
@@ -79,10 +84,24 @@ class IslandBar(QWidget):
         self._selected_tools = [k for k in (picked if isinstance(picked, list)
                                             else DEFAULT_TOOLS)
                                 if k in ALL_TOOLS] or list(DEFAULT_TOOLS)
+        # 老配置里没有新加的「网站收藏」：升级后自动出现在胶囊上一次；
+        # 之后用户再在工具箱里取消，不会被再次加回来。
+        if not cfg.get("fav_tool_introduced"):
+            if "fav" not in self._selected_tools:
+                self._selected_tools.append("fav")
+            cfg["capsule_tools"] = list(self._selected_tools)
+            cfg["fav_tool_introduced"] = True
+            try:
+                from core import config as config_mod
+                config_mod.save(cfg)
+            except Exception:
+                pass
         self.clip_watcher = None
         self.snip = None
         self.reminder_center = None
         self._visible_before_snip = True
+        self._runner = None              # 连点 20 次打开的隐藏跑酷窗
+        self._runner_was_visible = False
 
         # 所有工具浮层共用一套"点到别处就收"的规则，见 popup_guard.py
         self._popup_guard = PopupGuard(self._popup_widgets, self)
@@ -91,6 +110,7 @@ class IslandBar(QWidget):
         self._anchor: QPoint | None = None
         self._auto_hidden = False
         self._leave_t: float | None = time.monotonic() + 1.2
+        self._keep_out_until = 0.0        # 刚滑出来时多留一会儿，别让用户追不上
         self._anim: QPropertyAnimation | None = None
 
         self.setWindowFlags(
@@ -125,6 +145,15 @@ class IslandBar(QWidget):
         for _t in self.paced_timers:
             _t.start(_t.interval())
 
+        # 展开态闲置计时：鼠标/键盘在岛上停手一段时间后自己收回收起态
+        self.idle_timer = QTimer(self)
+        self.idle_timer.setInterval(1000)
+        self.idle_timer.timeout.connect(self._idle_tick)
+        self.idle_timer.start()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
         # 后台扫描：发现窗口/红点变化后发信号回来，界面在 _on_scan 里重建
         self.scanner = ScannerWorker(self.cfg, self.unread, self)
         self.scanner.scanned.connect(self._on_scan)
@@ -149,10 +178,21 @@ class IslandBar(QWidget):
     def shutdown(self) -> None:
         """退出前停掉后台扫描，避免线程带着 Qt 对象一起被销毁。"""
         try:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+        except Exception:
+            pass
+        try:
             self.scanner.stop()
         except Exception:
             pass
         self.lyric_bar.hide()
+        if self._runner is not None:
+            try:
+                self._runner.close()
+            except Exception:
+                pass
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -187,6 +227,7 @@ class IslandBar(QWidget):
         self.btn_snip = GlyphButton("snip", "区域截图", "区域截图")
         self.btn_bell = GlyphButton("bell", "新建提醒", "新建提醒")
         self.btn_rlist = GlyphButton("list", "提醒列表", "提醒列表")
+        self.btn_fav = GlyphButton("globe", "网站收藏", "网站收藏")
         self.btn_json = GlyphButton("json", f"在浏览器打开 bejson（{BEJSON_URL}）", "Bejson")
         self.btn_xls = GlyphButton("excel", "Excel 快捷键大全（可钉住）", "Excel 快捷键")
         self.btn_proj = GlyphButton("apps", "应用快开：开始菜单应用直接列出，点一下启动", "应用快开")
@@ -197,6 +238,7 @@ class IslandBar(QWidget):
             "snip": self.btn_snip,
             "bell": self.btn_bell,
             "list": self.btn_rlist,
+            "fav": self.btn_fav,
             "bejson": self.btn_json,
             "excel": self.btn_xls,
             "proj": self.btn_proj,
@@ -207,12 +249,13 @@ class IslandBar(QWidget):
         self.btn_snip.clicked.connect(self.start_snip)
         self.btn_bell.clicked.connect(self.open_reminder_new)
         self.btn_rlist.clicked.connect(self.open_reminder_list)
+        self.btn_fav.clicked.connect(self.open_favorites)
         self.btn_json.clicked.connect(self.open_bejson)
         self.btn_xls.clicked.connect(self.open_cheatsheet)
         self.btn_proj.clicked.connect(self.open_projects)
         self.btn_incident.clicked.connect(self.open_incident)
         self.btn_clerk.clicked.connect(self.open_clerk)
-        for key in ("clip", "snip", "bell", "list", "bejson", "excel",
+        for key in ("clip", "snip", "bell", "list", "fav", "bejson", "excel",
                     "proj", "incident", "clerk"):
             tool_row.addWidget(self._tool_buttons[key])
         for btn in self._tool_buttons.values():
@@ -228,6 +271,7 @@ class IslandBar(QWidget):
         # 不接照片、不生成小人；后续接入用户自有模型时再替换。
         self.btn_agent = AgentAvatarButton()
         self.btn_agent.setToolTip("点一下敲木鱼：功德 +1")
+        self.btn_agent.easter_egg.connect(self.open_runner)
         row.addWidget(self.btn_agent)
 
         row.addStretch(1)
@@ -355,6 +399,7 @@ class IslandBar(QWidget):
             "snip": ("截图", "框选一块屏幕区域，复制并保存 PNG", self.start_snip),
             "bell": ("提醒", "新建一条提醒，可以配截图", self.open_reminder_new),
             "list": ("提醒列表", "查看已有提醒，标完成或删除", self.open_reminder_list),
+            "fav": ("网站", "常用网站收藏，点一下用默认浏览器打开", self.open_favorites),
             "bejson": ("Bejson", f"在浏览器打开 {BEJSON_URL}", self.open_bejson),
             "excel": ("Excel 键", "Excel 快捷键大全（浮层里可以钉住）", self.open_cheatsheet),
             "proj": ("应用", "开始菜单应用列表，点一下启动；可切项目目录", self.open_projects),
@@ -362,7 +407,7 @@ class IslandBar(QWidget):
             "clerk": ("文员", "金额、日期、重命名、清单、文本", self.open_clerk),
         }
         self._exp_chips: dict = {}
-        for key in ("clip", "snip", "bell", "list", "bejson", "excel",
+        for key in ("clip", "snip", "bell", "list", "fav", "bejson", "excel",
                     "proj", "incident", "clerk"):
             text, tip, handler = spec[key]
             b = QPushButton(text)
@@ -398,30 +443,68 @@ class IslandBar(QWidget):
     # ---------- 交互：拖动 / 切换 ----------
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # 吸附动画还在跑时抓住它：先停在当前可见位置，再按鼠标算偏移，
+            # 否则动画会一边往回滑、拖动一边改位置，两边打架。
+            self._stop_slide()
+            if self._auto_hidden:
+                self._auto_hidden = False
+                self.move(self._visible_target())
             self._press_pos = event.globalPosition().toPoint()
+            self._drag_pos = self._press_pos - self.frameGeometry().topLeft()
             self._moved = False
+            self._leave_t = None
+            self._last_active = time.monotonic()
+            self.setCursor(Qt.ClosedHandCursor)
+            self.grabMouse()
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:
         if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
-            new_pos = event.globalPosition().toPoint() - self._drag_pos
+            gp = event.globalPosition().toPoint()
+            new_pos = gp - self._drag_pos
             # 和按下点比较，而不是和窗口左上角比较：否则轻轻一点也会被判成拖动
-            if (event.globalPosition().toPoint() - self._press_pos).manhattanLength() > 4:
+            if (gp - self._press_pos).manhattanLength() > 6:
                 self._moved = True
+            geo = self._screen_geo()
+            # 至少留一半在屏幕里，拖到边角也不会彻底找不回来
+            min_x, max_x = geo.left() - self.width() // 2, geo.right() - self.width() // 2
+            min_y, max_y = geo.top() - 8, geo.bottom() - self.height() // 2
+            new_pos.setX(max(min_x, min(max_x, new_pos.x())))
+            new_pos.setY(max(min_y, min(max_y, new_pos.y())))
             self.move(new_pos)
+            self._last_active = time.monotonic()
             event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             _dbg(f"release moved={self._moved} pos={event.globalPosition().toPoint()}")
+            try:
+                self.releaseMouse()
+            except Exception:
+                pass
+            self.unsetCursor()
             if not self._moved:
+                self._drag_pos = None
+                self._leave_t = None
                 self.toggle()
-            else:
-                # 拖动后把当前位置记为新的停靠点
-                self._anchor = self.pos()
+                event.accept()
+                return
+            # 拖动后把当前位置记为新的停靠点；并给 1 秒缓冲，
+            # 别刚松手鼠标往外一挪就立刻被吸回屏幕顶。
+            self._anchor = self.pos()
             self._drag_pos = None
+            self._leave_t = None
+            self._drag_grace_until = time.monotonic() + 1.0
+            self._last_active = time.monotonic()
             event.accept()
+
+    def _stop_slide(self) -> None:
+        if self._anim is not None:
+            try:
+                self._anim.stop()
+            except Exception:
+                pass
+            self._anim = None
 
     # ---------- 靠边隐藏 ----------
     def _screen_geo(self):
@@ -432,6 +515,25 @@ class IslandBar(QWidget):
         if self._anchor is not None:
             return QPoint(self._anchor)
         return QPoint(self.x(), self._screen_geo().top() + 8)
+
+    def visible_rect(self) -> QRect:
+        """胶囊“该出现”的矩形，不受靠边隐藏动画影响。
+
+        提醒气泡到点时胶囊可能正藏在上沿；如果拿实际 geometry 当锚点，
+        气泡会算到屏幕外或展开后正好压住胶囊。公共布局器和提醒中心都用
+        这个矩形作为锚点。
+        """
+        return QRect(self._visible_target(), self.size())
+
+    def _near_top_edge(self) -> bool:
+        """只有停在上沿附近才允许"靠边隐藏"。
+
+        用户把胶囊拖到屏幕中间/下方，是想让它留在那儿；如果还按原来的
+        逻辑在鼠标离开后收回屏幕顶，就会表现为"怎么拖都拖不上去/一追就缩"。
+        这里用 32px 的感应带，拖出这条带就不再自动收。
+        """
+        anchor_y = self._anchor.y() if self._anchor is not None else self.y()
+        return anchor_y <= self._screen_geo().top() + 32
 
     def _slide_to(self, target: QPoint) -> None:
         if self.pos() == target:
@@ -459,11 +561,12 @@ class IslandBar(QWidget):
         if not self._auto_hidden:
             return
         self._auto_hidden = False
+        self._keep_out_until = time.monotonic() + 1.5
         self.show()
         self._slide_to(self._visible_target())
 
     def _hide_to_edge(self) -> None:
-        if self._auto_hidden:
+        if self._auto_hidden or not self._near_top_edge():
             return
         self._hide_tool_hover()
         self._auto_hidden = True
@@ -471,13 +574,30 @@ class IslandBar(QWidget):
         self._slide_to(QPoint(self.x(), geo.top() - self.height()))
 
     def _edge_tick(self) -> None:
+        # 彩蛋跑酷开着：胶囊已经藏起来，别让贴顶唤出把它重新盖到游戏上面
+        if self._runner is not None:
+            self._leave_t = None
+            return
         # 工具箱开着：一直露着，等用户点「完成」再恢复靠边隐藏
         if self._toolbox_open:
             self._leave_t = None
             self._show_from_edge()
             return
-        # 拖动中、展开态：保持可见，不收起
-        if self._drag_pos is not None or self.expanded:
+        # 拖动中：保持可见，绝不能在拖动过程中播放"缩回"动画
+        if self._drag_pos is not None:
+            self._leave_t = None
+            if self._auto_hidden:
+                self._auto_hidden = False
+                self.move(self._visible_target())
+            return
+        # 刚拖完 / 刚滑出来：先别吸回，给用户把鼠标移过去的余地
+        if (time.monotonic() < self._drag_grace_until
+                or time.monotonic() < self._keep_out_until):
+            self._leave_t = None
+            self._show_from_edge()
+            return
+        # 展开态：保持可见，收起由 _idle_tick 负责
+        if self.expanded:
             self._leave_t = None
             self._show_from_edge()
             return
@@ -493,6 +613,11 @@ class IslandBar(QWidget):
         if self._blink_keys:
             self._leave_t = None
             self._show_from_edge()
+            return
+
+        # 已经拖离顶边感应带：就当普通悬浮窗留在原地，不再自动吸回屏幕顶
+        if not self._near_top_edge():
+            self._leave_t = None
             return
 
         cursor = QCursor.pos()
@@ -533,6 +658,43 @@ class IslandBar(QWidget):
         if not enable:
             self._show_from_edge()
 
+    def set_idle_collapse(self, seconds: int) -> None:
+        """展开态闲置多少秒自动收回；0 = 关闭。"""
+        try:
+            sec = max(0, int(seconds))
+        except (TypeError, ValueError):
+            sec = 0
+        self._idle_collapse_sec = sec
+        self.cfg["expanded_idle_sec"] = sec
+        self._last_active = time.monotonic()
+
+    def _idle_tick(self) -> None:
+        if not self.expanded or self._idle_collapse_sec <= 0:
+            return
+        if self._drag_pos is not None or self._toolbox_open:
+            self._last_active = time.monotonic()
+            return
+        if self._popup_widgets():
+            # 卡片还开着，说明用户在看内容，不算"没操作"
+            self._last_active = time.monotonic()
+            return
+        if time.monotonic() - self._last_active >= self._idle_collapse_sec:
+            _dbg(f"idle {self._idle_collapse_sec}s -> collapse")
+            self.collapse()
+
+    def eventFilter(self, obj, event) -> bool:
+        """展开态只要鼠标在岛上动/点/滚，就把闲置计时重置。"""
+        if self.expanded and event.type() in (
+            QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
+            QEvent.MouseButtonDblClick, QEvent.Wheel, QEvent.KeyPress,
+        ):
+            try:
+                if self.frameGeometry().contains(QCursor.pos()):
+                    self._last_active = time.monotonic()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
     def _music_label_h(self) -> int:
         """歌名按当前宽度换行后的实际高度（1 行 18、2 行 36），用来算面板高度。"""
         text = self.music_label.text() or ""
@@ -570,6 +732,7 @@ class IslandBar(QWidget):
     def toggle(self) -> None:
         self.expanded = not self.expanded
         _dbg(f"toggle -> expanded={self.expanded}")
+        self._last_active = time.monotonic()
         if self.expanded:
             self.stack.setCurrentWidget(self.expanded_page)
             w, h = self._expanded_size()
@@ -582,7 +745,7 @@ class IslandBar(QWidget):
 
     def _reflow_popups(self) -> None:
         """岛尺寸变了：把已经打开的工具浮层重新贴到岛下方，避免和展开面板重叠。"""
-        geo = self.geometry()
+        geo = self.visible_rect()
         if self.reminder_center is not None:
             self.reminder_center.reposition(geo)
         if self.clip_panel is not None and self.clip_panel.isVisible():
@@ -591,23 +754,98 @@ class IslandBar(QWidget):
             self.cheatsheet.popup_near(geo)
         if self.toolbox is not None and self.toolbox.isVisible():
             self.toolbox.popup_near(geo)
+        if self.favorites_panel is not None and self.favorites_panel.isVisible():
+            self.favorites_panel.popup_near(geo)
+
+    def _reminder_windows(self) -> list:
+        """提醒中心当前挂着的卡片窗口（弹窗、列表、抽屉……），不写死名字。
+
+        右侧 To Do 抽屉这类后来加的卡片，只要挂在 ReminderCenter 上就会被
+        自动纳入互斥和"浮层开着不缩回"的判断，不用每加一张卡就改 bar。
+        """
+        center = self.reminder_center
+        if center is None:
+            return []
+        out = []
+        seen = set()
+        for value in vars(center).values():
+            if not isinstance(value, QWidget) or value.__class__.__name__ == "ReminderBubble":
+                continue
+            if id(value) not in seen:
+                seen.add(id(value))
+                out.append(value)
+        return out
 
     def _popup_widgets(self) -> list:
         """当前露着的工具浮层。到点的内容泡不算：它必须由用户手动处理。"""
         out = []
         for w in (self.cheatsheet, self.clip_panel, self.toolbox,
-                  self.app_panel, self.project_panel, self.incident_panel,
-                  self.clerk_panel):
+                  self.favorites_panel, self.app_panel, self.project_panel,
+                  self.incident_panel, self.clerk_panel):
             if w is not None and w.isVisible():
                 out.append(w)
-        if self.reminder_center is not None:
-            for w in (self.reminder_center.dialog, self.reminder_center.list_panel):
-                if w.isVisible():
-                    out.append(w)
+        for w in self._reminder_windows():
+            if w.isVisible():
+                out.append(w)
         viewer = current_viewer()
         if viewer is not None:
             out.append(viewer)
         return out
+
+    def _dismiss_others(self, keep=None) -> None:
+        """卡片互斥：开一张新卡片前，把其他卡片全收掉。
+
+        每个入口原先各写一套 hide，漏一个就会两张卡叠在一起；统一在这里收口，
+        以后新增卡片只要挂在 ReminderCenter 或登记进 `_popup_widgets` 就会自动遵守。
+        钉住的速查卡在被"打开另一张卡"时也收：钉住只挡自动收起，不挡换卡。
+        """
+        wins = [self.cheatsheet, self.clip_panel, self.favorites_panel,
+                self.app_panel, self.project_panel, self.incident_panel,
+                self.clerk_panel]
+        wins += self._reminder_windows()
+        for win in wins:
+            if win is None or win is keep or not win.isVisible():
+                continue
+            win.hide()
+        if (self.toolbox is not None and self.toolbox is not keep
+                and self.toolbox.isVisible()):
+            self.toolbox.close_panel()
+
+    def open_runner(self) -> None:
+        """木鱼头像连点 20 次的彩蛋：在原位开一条木鱼跑酷。
+
+        宽度取当前胶囊宽度，高度约为胶囊的八成；打开时把胶囊藏起来，视觉上
+        就是胶囊变成了一条小游戏。再点一次头像 / Esc 退出后恢复。
+        """
+        if self._runner is not None:
+            try:
+                self._runner.close()
+            except Exception:
+                pass
+            return
+        from .runner import RunnerGame
+        self._dismiss_others()
+        w = self.width()
+        # 只比胶囊略矮一点：高度太低会把画面压扁，也没法正常跳跃。
+        # 目标约胶囊高度的 82%，收起态通常得到 482×57。
+        h = max(52, min(72, int(round(self.height() * 0.82))))
+        game = RunnerGame(w, h)
+        geo = self.geometry()
+        game.move(geo.center().x() - w // 2,
+                  geo.center().y() - h // 2)
+        game.closed.connect(self._on_runner_closed)
+        self._runner = game
+        self._runner_was_visible = self.isVisible()
+        self.hide()
+        game.show_game()
+
+    def _on_runner_closed(self) -> None:
+        self._runner = None
+        if self._runner_was_visible:
+            self.show()
+            self.raise_()
+            self._leave_t = time.monotonic() + 1.2
+        self._runner_was_visible = False
 
     def collapse(self) -> None:
         """展开态收回收起态（点完账号立刻收起，别让浮层压住刚唤起的窗口）。"""
@@ -997,15 +1235,14 @@ class IslandBar(QWidget):
         """到点没处理的条数：铃铛点亮，收起态也看得见；列表键只做提示不另挂角标。"""
         self.btn_bell.set_alert(bool(count))
 
-    @staticmethod
-    def _toggle_popup(win, opener) -> bool:
-        """点一次开、再点一次关。浮层的显隐只由按钮和 PopupGuard 决定，不自己收。"""
+    def _toggle_popup(self, win, opener) -> bool:
+        """点一次开、再点一次关；开之前先把别的卡片收掉，保证同一时刻只有一张。"""
         if win.isVisible():
             win.hide()
             return True
+        self._dismiss_others(keep=win)
         opener()
         return True
-
     def open_reminder_new(self) -> None:
         center = self.reminder_center
         if center is None:
@@ -1047,7 +1284,7 @@ class IslandBar(QWidget):
                 self.reminder_center.hide_all()
             self._hide_cheatsheet()
             self._hide_work_panels()
-            self.clip_panel.popup_near(self.geometry())
+            self.clip_panel.popup_near(self.visible_rect())
 
         self._toggle_popup(self.clip_panel, _open)
 
@@ -1068,7 +1305,7 @@ class IslandBar(QWidget):
             if self._auto_hidden:
                 self._show_from_edge()
             self._hide_work_panels()
-            self.cheatsheet.popup_near(self.geometry())
+            self.cheatsheet.popup_near(self.visible_rect())
 
         self._toggle_popup(self.cheatsheet, _open)
 
@@ -1104,6 +1341,17 @@ class IslandBar(QWidget):
             self.clerk_panel = ClerkPanel()
         return self.clerk_panel
 
+    def _ensure_favorites_panel(self):
+        if self.favorites_panel is None:
+            from .favorites import FavoritesPanel
+            self.favorites_panel = FavoritesPanel()
+        return self.favorites_panel
+
+    def open_favorites(self) -> None:
+        """网站收藏：点胶囊图标打开列表，行内点击用默认浏览器跳转。"""
+        panel = self._ensure_favorites_panel()
+        self._open_work_panel(panel)
+
     def _show_tool_hover(self, name: str, anchor) -> None:
         if not name:
             self._hide_tool_hover()
@@ -1121,10 +1369,11 @@ class IslandBar(QWidget):
         if self._toast is None:
             self._toast = Toast()
         self._toast.set_text(text)
-        self._toast.show_at(self.geometry())
+        self._toast.show_at(self.visible_rect())
 
     def _hide_work_panels(self, keep=None) -> None:
-        for win in (self.project_panel, self.app_panel, self.incident_panel, self.clerk_panel):
+        for win in (self.project_panel, self.app_panel, self.incident_panel,
+                    self.clerk_panel, self.favorites_panel):
             if win is not None and win is not keep and win.isVisible():
                 win.hide()
 
@@ -1132,18 +1381,12 @@ class IslandBar(QWidget):
         if panel.isVisible():
             panel.hide()
             return
-        if self.clip_panel is not None:
-            self.clip_panel.hide()
-        if self.reminder_center is not None:
-            self.reminder_center.hide_all()
-        self._hide_cheatsheet()
-        if self.toolbox is not None and self.toolbox.isVisible():
-            self.toolbox.close_panel()
+        self._dismiss_others(keep=panel)
         self._hide_work_panels(keep=panel)
         if self._auto_hidden:
             self._show_from_edge()
         self._leave_t = None
-        panel.popup_near(self.geometry())
+        panel.popup_near(self.visible_rect())
 
     def open_projects(self) -> None:
         """应用快开：默认打开开始菜单应用列表，不再让用户进目录找 exe。"""
@@ -1223,6 +1466,8 @@ class IslandBar(QWidget):
             self.incident_panel.hide()
         elif key == "clerk" and self.clerk_panel is not None:
             self.clerk_panel.hide()
+        elif key == "fav" and self.favorites_panel is not None:
+            self.favorites_panel.hide()
 
     def prewarm_toolbox(self) -> None:
         """启动时把工具箱窗口先建好并离屏显示一次。
@@ -1251,18 +1496,13 @@ class IslandBar(QWidget):
         if self.toolbox.isVisible():
             self.toolbox.close_panel()
             return
-        if self.clip_panel is not None:
-            self.clip_panel.hide()
-        if self.reminder_center is not None:
-            self.reminder_center.hide_all()
-        self._hide_cheatsheet()
-        self._hide_work_panels()
+        self._dismiss_others(keep=self.toolbox)
         if self._auto_hidden:
             self._show_from_edge()
         self._toolbox_open = True
         self._leave_t = None
         self.toolbox.set_selected(self._selected_tools)
-        self.toolbox.popup_near(self.geometry())
+        self.toolbox.popup_near(self.visible_rect())
 
     def _on_tools_changed(self, keys: list) -> None:
         from core import config as config_mod
@@ -1285,7 +1525,7 @@ class IslandBar(QWidget):
         self._apply_tool_visibility()
         self._apply_collapsed_size()
         if self.toolbox is not None and self.toolbox.isVisible():
-            self.toolbox.popup_near(self.geometry())
+            self.toolbox.popup_near(self.visible_rect())
 
     def _on_toolbox_closed(self) -> None:
         self._toolbox_open = False
@@ -1298,6 +1538,11 @@ class IslandBar(QWidget):
 
     def hide_for_snip(self) -> None:
         """截图前把岛和歌词条让开，别把自己截进去。"""
+        if self._runner is not None:
+            try:
+                self._runner.close()
+            except Exception:
+                pass
         self._visible_before_snip = self.isVisible()
         try:
             self.lyric_bar.hide()
@@ -1306,6 +1551,7 @@ class IslandBar(QWidget):
         if self.reminder_center is not None:
             # 提醒弹层也一起收，不然会被冻进截图里
             self.reminder_center.hide_all()
+        self._dismiss_others()
         if self.cheatsheet is not None:
             self.cheatsheet.hide()
         if self.toolbox is not None and self.toolbox.isVisible():

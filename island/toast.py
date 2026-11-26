@@ -5,6 +5,8 @@ from PySide6.QtCore import QPropertyAnimation, QRect, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
+from .popup_layout import place_popup
+
 
 class Toast(QWidget):
     LIFE_MS = 360
@@ -39,14 +41,9 @@ class Toast(QWidget):
     def show_at(self, anchor: QRect) -> None:
         self._fade.stop()
         self.setWindowOpacity(1.0)
-        screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
-        geo = screen.availableGeometry()
-        x = anchor.center().x() - self.width() // 2
-        y = anchor.bottom() + 6
-        x = max(geo.left() + 4, min(x, geo.right() - self.width() - 4))
-        if y + self.height() > geo.bottom():
-            y = max(geo.top() + 4, anchor.top() - self.height() - 6)
-        self.move(x, y)
+        # 提示条同样纳入公共浮层表：有提醒气泡或工具卡片时自动让位，
+        # 不再和胶囊/卡片压在同一块区域。
+        place_popup(self, anchor, gap=6)
         self.show()
         self.raise_()
         self._hide_timer.start(self.LIFE_MS)

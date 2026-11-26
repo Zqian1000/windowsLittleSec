@@ -62,6 +62,9 @@ DEFAULTS = {
     "clip_limit": 30,              # 未固定的最多留几条
     "snip_hotkey": "ctrl+alt+x",   # 区域截图全局热键，留空则不注册
     "snip_dir": "",                # 截图保存目录，空 = 图片\小二截图
+    "snip_confirm": False,         # 截完是否先弹确认卡；默认直接复制保存
+    "expanded_idle_sec": 30,       # 展开态无操作多少秒自动收回，0 = 不自动收
+    "clip_image": True,            # 剪贴板是否记录图片（和 Win+V 一样图文都能存）
     "accent": "#2d7dff",
     "capsule_tools": ["clip", "snip", "bell", "list", "bejson", "excel"],
     "dock": "top",  # top / left / right

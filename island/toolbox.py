@@ -16,6 +16,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import QWidget
 
 from .widgets import draw_glyph
+from .popup_layout import place_popup
 
 BG = "#1c1c1e"
 TEXT = "#f2f2f7"
@@ -36,6 +37,7 @@ TOOLS: Sequence[tuple[str, str, str, str]] = (
     ("snip", "区域截图", "框选屏幕区域，Ctrl+Alt+X 也能触发", "snip"),
     ("bell", "新建提醒", "到点弹内容泡，可配截图", "bell"),
     ("list", "提醒列表", "查看、完成、删除已有提醒", "list"),
+    ("fav", "网站收藏", "收藏常用网站，点一下用默认浏览器打开", "globe"),
     ("bejson", "Bejson", "用浏览器打开 JSON 格式化工具站", "json"),
     ("excel", "Excel 快捷键", "速查卡，可钉在屏幕上对照操作", "excel"),
     ("proj", "应用快开", "直接列出开始菜单应用，点一下启动；也能切到项目目录", "apps"),
@@ -43,7 +45,7 @@ TOOLS: Sequence[tuple[str, str, str, str]] = (
     ("clerk", "文员工具", "金额大写、日期、重命名、清单、文本整理", "doc"),
 )
 ICONS = {key: icon for key, _name, _desc, icon in TOOLS}
-DEFAULT_TOOLS = ["clip", "snip", "bell", "list", "bejson", "excel"]
+DEFAULT_TOOLS = ["clip", "snip", "bell", "list", "fav", "bejson", "excel"]
 ALL_TOOLS = [k for k, _n, _d, _i in TOOLS]
 HEIGHT = CHECK_TOP + len(TOOLS) * ROW_H + FOOT_H + PAD + 8
 
@@ -97,14 +99,7 @@ class ToolboxPanel(QWidget):
 
     # ---- 位置/关闭 ----
     def popup_near(self, anchor: QRect) -> None:
-        screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
-        geo = screen.availableGeometry()
-        x = anchor.center().x() - self.width() // 2
-        y = anchor.bottom() + 8
-        x = max(geo.left() + 6, min(x, geo.right() - self.width() - 6))
-        if y + self.height() > geo.bottom():
-            y = max(geo.top() + 6, anchor.top() - self.height() - 8)
-        self.move(x, y)
+        place_popup(self, anchor)
         self.show()
         self.raise_()
         self.activateWindow()

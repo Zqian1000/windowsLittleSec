@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from .popup_layout import place_popup
+
 BG = "#1c1c1e"
 CARD = "#242426"
 TEXT = "#f2f2f7"
@@ -274,9 +276,11 @@ class CheatSheetPanel(QWidget):
         self.scroll.setFixedHeight(max(110, h - self._overhead))
         self.setFixedHeight(h)
 
-        x = anchor.center().x() - self.width() // 2
-        x = max(geo.left() + 6, min(x, geo.right() - self.width() - 6))
-        self.move(x, y)
+        # 高度先按屏幕可用空间裁好，具体落点交给公共布局器避让胶囊/其他卡片。
+        first = "below" if below >= above else "above"
+        place_popup(self, anchor,
+                    preferred=(first, "below" if first == "above" else "above",
+                               "right", "left"))
         self.show()
         self.raise_()
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import (
-    QDateTime, QObject, QRect, Qt, QTimer, Signal,
+    QDateTime, QObject, QRect, QTime, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QColor, QGuiApplication, QKeySequence, QPainter, QBrush, QPixmap, QShortcut,
@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 
 from core import config
 from .image_viewer import show_image
+from .popup_layout import place_popup
+from .reminder_drawer import ReminderDrawer
 from core.reminders import Reminder, ReminderStore
 
 BG = "#1c1c1e"
@@ -71,14 +73,7 @@ class _Card(QWidget):
 
     def popup_near(self, anchor: QRect) -> None:
         self.adjustSize()
-        screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
-        geo = screen.availableGeometry()
-        x = anchor.center().x() - self.width() // 2
-        y = anchor.bottom() + 8
-        x = max(geo.left() + 6, min(x, geo.right() - self.width() - 6))
-        if y + self.height() > geo.bottom():
-            y = max(geo.top() + 6, anchor.top() - self.height() - 8)
-        self.move(x, y)
+        place_popup(self, anchor)
         self.show()
         self.raise_()
 
@@ -104,7 +99,7 @@ class ReminderDialog(_Card):
         self.text.setFixedHeight(62)
         self.text.setStyleSheet(
             f"QPlainTextEdit{{background:{CARD};color:{TEXT};border:none;"
-            "border-radius:9px;padding:7px;font-size:12px;}}")
+            "border-radius:9px;padding:7px;font-size:12px;}")
         self.body.addWidget(self.text)
 
         when_row = QHBoxLayout()
@@ -112,12 +107,13 @@ class ReminderDialog(_Card):
         lab = QLabel("时间")
         lab.setStyleSheet(f"color:{SUBTEXT}; font-size:11px;")
         when_row.addWidget(lab)
-        self.when = QDateTimeEdit(QDateTime.currentDateTime().addSecs(600))
+        self.when = QDateTimeEdit(self._minute_time(
+            QDateTime.currentDateTime().addSecs(600)))
         self.when.setCalendarPopup(True)
         self.when.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.when.setStyleSheet(
             f"QDateTimeEdit{{background:{CARD};color:{TEXT};border:none;"
-            "border-radius:8px;padding:5px 8px;font-size:12px;}}"
+            "border-radius:8px;padding:5px 8px;font-size:12px;}"
             "QDateTimeEdit::drop-down{border:none;width:16px;}")
         when_row.addWidget(self.when, 1)
         self.body.addLayout(when_row)
@@ -185,7 +181,8 @@ class ReminderDialog(_Card):
     # ---- 打开 ----
     def open_new(self, image_path: str = "") -> None:
         self.text.clear()
-        self.when.setDateTime(QDateTime.currentDateTime().addSecs(600))
+        self.when.setDateTime(self._minute_time(
+            QDateTime.currentDateTime().addSecs(600)))
         self.hint.hide()
         self.set_image(image_path)
         self.adjustSize()
@@ -234,13 +231,23 @@ class ReminderDialog(_Card):
         self.activateWindow()
 
     # ---- 保存 ----
+    @staticmethod
+    def _minute_time(dt: QDateTime) -> QDateTime:
+        """界面只显示到分钟，秒必须归零，不能把打开弹窗时的秒带进提醒。"""
+        t = dt.time()
+        return QDateTime(dt.date(), QTime(t.hour(), t.minute(), 0),
+                         dt.timeSpec())
+
+    def _due_epoch(self) -> float:
+        return self._minute_time(self.when.dateTime()).toPython().timestamp()
+
     def _save(self) -> None:
         text = self.text.toPlainText().strip()
         if not text and not self._image:
             self.hint.setText("写点内容，或者截一张图")
             self.hint.show()
             return
-        due = self.when.dateTime().toPython().timestamp()
+        due = self._due_epoch()
         image = _copy_image(self._image) if self._image else ""
         item = self.store.add(text or "看图提醒", due, image)
         self.hide()
@@ -556,13 +563,17 @@ class ReminderCenter(QObject):
         self._anchor = anchor_provider
         self._alt_anchor: Optional[Callable[[], QRect]] = None
         self._bubble: Optional[ReminderBubble] = None
-        self.dialog = ReminderDialog(store, snip)
+        from .recur_dialog import RecurringReminderDialog
+        self.dialog = RecurringReminderDialog(store, snip)
         self.dialog.saved.connect(lambda _rid: self._after_change())
-        self.list_panel = ReminderListPanel(store, on_new=self.new_reminder)
+        self.list_panel = ReminderDrawer(
+            store, on_changed=self._after_change, on_new=self.new_reminder)
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.check)
-        self.timer.start(10000)
+        # 提醒精确到分钟，每秒检查一次，避免 10 秒轮询把 :00 拖到 :09。
+        self.timer.start(1000)
 
     # ---- 入口 ----
     def set_alt_anchor(self, provider: Optional[Callable[[], QRect]]) -> None:
@@ -615,7 +626,10 @@ class ReminderCenter(QObject):
     def check(self) -> None:
         self.badge_changed.emit(self.store.overdue_count())
         if self._bubble is not None:
-            return
+            if self._bubble.isVisible():
+                return
+            # 窗口被系统/其他方式关掉时，别让旧引用把后续提醒永久卡住
+            self._bubble = None
         due = self.store.due_now()
         if not due:
             return
@@ -652,3 +666,4 @@ class ReminderCenter(QObject):
     def _after_change(self) -> None:
         self.badge_changed.emit(self.store.overdue_count())
         QTimer.singleShot(300, self.check)
+

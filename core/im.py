@@ -145,6 +145,15 @@ class IMClient:
                 or (any(cls.endswith(s) for s in self.class_suffix)
                     and any(cls.startswith(p) for p in self.class_prefix)))
 
+    def accept_window(self, hwnd: int, cls: str, title: str) -> bool:
+        """类名相同但样式/标题不像主窗口的辅助窗，在这里再筛一层。
+
+        QQ NT 一个进程里会同时存在好几个 Chrome_WidgetWin_1 顶层窗，标题都叫
+        「QQ」，其中没有标题栏的浮层/阴影窗会被一起选中。按类名选会把它们当成主窗口，
+        唤起后就会出现「页面出来了但点不动」。默认不筛，客户端需要时覆盖。
+        """
+        return True
+
     def activate(self, hwnd: int) -> bool:
         """按声明的顺序唤起窗口，成功即停。
 
@@ -216,9 +225,36 @@ class FeishuClient(IMClient):
 
 
 class QQClient(IMClient):
+    """QQ。
+
+    QQ NT 的主窗口是新版 Chromium 壳（Chrome_WidgetWin_1），但同一个进程
+    里还有登录窗、迷你面板、图片查看器和无标题栏的阴影/浮层窗，标题都可能是
+    「QQ」。这里只留下有标题栏、无 owner、标题以 QQ 开头的顶层窗口；再启动一次
+    还会多出一个实例，所以唤起只点它自己的任务栏/托盘入口，最后才外部兜底。
+    """
+
     key, name = "qq", "QQ"
     exes = ("qq.exe",)
+    class_exact = ("TXGuiFoundation", "Chrome_WidgetWin_1")
     shell_names = ("QQ",)
+    supports_launch = False
+    activation_order = ("shell", "force")
+
+    def accept_window(self, hwnd: int, cls: str, title: str) -> bool:
+        if not title.strip().startswith("QQ"):
+            return False
+        if cls != "Chrome_WidgetWin_1":
+            return True
+        try:
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            if not (style & win32con.WS_CAPTION):
+                return False
+            if win32gui.GetWindow(hwnd, win32con.GW_OWNER):
+                return False
+        except Exception:
+            return False
+        return True
+
 
 
 class DingTalkClient(IMClient):
@@ -374,6 +410,8 @@ def _client_windows(client: "IMClient", pid: int) -> List[int]:
                 return True
             cls = win32gui.GetClassName(hwnd)
             if not client.is_main_window_class(cls):
+                return True
+            if not client.accept_window(hwnd, cls, win32gui.GetWindowText(hwnd)):
                 return True
             _, p = win32process.GetWindowThreadProcessId(hwnd)
             if pid and p != pid:
@@ -967,6 +1005,8 @@ def list_accounts(enabled: Dict[str, bool]) -> List[IMAccount]:
         exe = _process_name(pid, pid_cache)
         client = ROSTER.match(exe, cls)
         if client is None or not enabled.get(client.key, False):
+            return True
+        if not client.accept_window(hwnd, cls, title):
             return True
 
         visible = bool(win32gui.IsWindowVisible(hwnd))
